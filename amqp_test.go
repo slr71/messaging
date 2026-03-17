@@ -391,6 +391,73 @@ func TestListen_ReturnsErrorInsteadOfExit(t *testing.T) {
 	}
 }
 
+func TestListen_ReturnsNilOnGracefulClose(t *testing.T) {
+	silenceLoggers(t)
+
+	uri, cleanup := startFakeAMQPServer(t)
+	defer cleanup()
+
+	client, err := NewClient(uri, false)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Close the errors channel after a short delay to simulate a
+	// graceful shutdown (e.g. caller called Close()).
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		close(client.errors)
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Listen()
+	}()
+
+	select {
+	case listenErr := <-errCh:
+		if listenErr != nil {
+			t.Fatalf("Listen returned %v, expected nil on graceful close", listenErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Listen did not return within 5 seconds")
+	}
+}
+
+func TestListen_ReturnsNilOnNilError(t *testing.T) {
+	silenceLoggers(t)
+
+	uri, cleanup := startFakeAMQPServer(t)
+	defer cleanup()
+
+	client, err := NewClient(uri, false)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	// Send a nil *amqp.Error to simulate the zero-value receive that
+	// can happen when a NotifyClose channel is closed during shutdown.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		client.errors <- nil
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Listen()
+	}()
+
+	select {
+	case listenErr := <-errCh:
+		if listenErr != nil {
+			t.Fatalf("Listen returned %v, expected nil for nil AMQP error", listenErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Listen did not return within 5 seconds")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Integration tests (require RUN_INTEGRATION_TESTS + live RabbitMQ)
 // ---------------------------------------------------------------------------

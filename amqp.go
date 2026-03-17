@@ -225,7 +225,11 @@ func (c *Client) Listen() error {
 			c.consumers = append(c.consumers, &cs.consumer)
 			Info.Println("Done adding a new consumer")
 			cs.latch <- 1
-		case err := <-c.errors:
+		case err, ok := <-c.errors:
+			if !ok || err == nil {
+				// Channel closed or nil error: clean shutdown (e.g. caller called Close()).
+				return nil
+			}
 			Error.Printf("An error in the connection to the AMQP broker occurred:\n%s", err)
 			if c.Reconnect {
 				c.doReconnect()
