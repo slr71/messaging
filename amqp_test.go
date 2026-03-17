@@ -175,7 +175,7 @@ func TestStopQueueName(t *testing.T) {
 	actual := StopQueueName(invID)
 	expected := fmt.Sprintf("road-runner-%s-stops-request", invID)
 	if actual != expected {
-		t.Errorf("StopQueueName returneed %s instead of %s", actual, expected)
+		t.Errorf("StopQueueName returned %s instead of %s", actual, expected)
 	}
 }
 
