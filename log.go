@@ -5,12 +5,11 @@ import (
 	"os"
 )
 
-// Logger defines a loggng interface for this module.
-
+// Logger defines a logging interface for this module.
 type Logger interface {
-	Print(args ...interface{})
-	Printf(format string, args ...interface{})
-	Println(args ...interface{})
+	Print(args ...any)
+	Printf(format string, args ...any)
+	Println(args ...any)
 }
 
 var (

@@ -3,14 +3,23 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/cyverse-de/model/v10"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+// ---------------------------------------------------------------------------
+// Integration-test helpers (require RUN_INTEGRATION_TESTS + live RabbitMQ)
+// ---------------------------------------------------------------------------
 
 var client *Client
 
@@ -24,7 +33,7 @@ func GetClient(t *testing.T) *Client {
 		t.Error(err)
 	}
 	_ = client.SetupPublishing(exchange())
-	go client.Listen()
+	go func() { _ = client.Listen() }()
 	return client
 }
 
@@ -49,6 +58,280 @@ func exchange() string {
 func exchangeType() string {
 	return "topic"
 }
+
+// ---------------------------------------------------------------------------
+// Unit-test helpers (no broker required)
+// ---------------------------------------------------------------------------
+
+// silenceLoggers suppresses log output during tests and restores the
+// original loggers when the test finishes.
+func silenceLoggers(t *testing.T) {
+	t.Helper()
+	origInfo, origWarn, origError := Info, Warn, Error
+	quiet := log.New(io.Discard, "", 0)
+	Info, Warn, Error = quiet, quiet, quiet
+	t.Cleanup(func() {
+		Info, Warn, Error = origInfo, origWarn, origError
+	})
+}
+
+// startFakeAMQPServer starts a minimal TCP listener that speaks just enough
+// of AMQP 0-9-1 to let amqp091-go complete its handshake. It returns the
+// AMQP URI and a cleanup function.
+//
+// The protocol flow is:
+//  1. Client sends "AMQP\x00\x00\x09\x01" (protocol header).
+//  2. Server sends Connection.Start (method 10,10).
+//  3. Client sends Connection.StartOk.
+//  4. Server sends Connection.Tune.
+//  5. Client sends Connection.TuneOk.
+//  6. Client sends Connection.Open.
+//  7. Server sends Connection.OpenOk.
+//
+// After that the connection is "open" from the client library's perspective.
+func startFakeAMQPServer(t *testing.T) (uri string, cleanup func()) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // listener closed
+			}
+			go handleFakeAMQPConn(conn)
+		}
+	}()
+
+	addr := ln.Addr().(*net.TCPAddr)
+	uri = fmt.Sprintf("amqp://guest:guest@127.0.0.1:%d/", addr.Port)
+	cleanup = func() { _ = ln.Close() }
+	return uri, cleanup
+}
+
+// handleFakeAMQPConn drives the server side of a minimal AMQP handshake
+// and then keeps the connection open until the client disconnects.
+func handleFakeAMQPConn(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+
+	// 1. Read protocol header (8 bytes): "AMQP\x00\x00\x09\x01"
+	header := make([]byte, 8)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return
+	}
+
+	// 2. Send Connection.Start
+	writeFrame(conn, 1, 0, connectionStart())
+
+	// 3. Read Connection.StartOk frame
+	if !readFrame(conn) {
+		return
+	}
+
+	// 4. Send Connection.Tune
+	writeFrame(conn, 1, 0, connectionTune())
+
+	// 5. Read Connection.TuneOk frame
+	if !readFrame(conn) {
+		return
+	}
+
+	// 6. Read Connection.Open frame
+	if !readFrame(conn) {
+		return
+	}
+
+	// 7. Send Connection.OpenOk
+	writeFrame(conn, 1, 0, connectionOpenOk())
+
+	// Keep connection open, reading frames until the client disconnects.
+	for {
+		frameType, channel, payload, ok := readFrameFull(conn)
+		if !ok {
+			return
+		}
+		// Method frame
+		if frameType == 1 && len(payload) >= 4 {
+			classID := uint16(payload[0])<<8 | uint16(payload[1])
+			methodID := uint16(payload[2])<<8 | uint16(payload[3])
+
+			switch {
+			case classID == 20 && methodID == 10:
+				// Channel.Open -> Channel.OpenOk
+				writeFrame(conn, 1, channel, channelOpenOk())
+			case classID == 10 && methodID == 50:
+				// Connection.Close -> Connection.CloseOk
+				writeFrame(conn, 1, 0, connectionCloseOk())
+				return
+			case classID == 20 && methodID == 40:
+				// Channel.Close -> Channel.CloseOk
+				writeFrame(conn, 1, channel, channelCloseOk())
+			case classID == 40 && methodID == 10:
+				// Exchange.Declare -> Exchange.DeclareOk
+				writeFrame(conn, 1, channel, exchangeDeclareOk())
+			case classID == 50 && methodID == 10:
+				// Queue.Declare -> Queue.DeclareOk
+				writeFrame(conn, 1, channel, queueDeclareOk())
+			case classID == 50 && methodID == 20:
+				// Queue.Bind -> Queue.BindOk
+				writeFrame(conn, 1, channel, queueBindOk())
+			case classID == 60 && methodID == 20:
+				// Basic.Consume -> Basic.ConsumeOk
+				writeFrame(conn, 1, channel, basicConsumeOk())
+			case classID == 60 && methodID == 30:
+				// Basic.Cancel -> Basic.CancelOk
+				writeFrame(conn, 1, channel, basicCancelOk())
+			case classID == 60 && methodID == 10:
+				// Basic.Qos -> Basic.QosOk
+				writeFrame(conn, 1, channel, basicQosOk())
+			case classID == 85 && methodID == 10:
+				// Confirm.Select -> Confirm.SelectOk
+				writeFrame(conn, 1, channel, confirmSelectOk())
+			default:
+				// Ignore other frames
+			}
+		}
+	}
+}
+
+// --- AMQP frame encoding/decoding helpers ---
+
+func writeFrame(conn net.Conn, frameType byte, channel uint16, payload []byte) {
+	size := uint32(len(payload))
+	frame := make([]byte, 7+len(payload)+1)
+	frame[0] = frameType
+	frame[1] = byte(channel >> 8)
+	frame[2] = byte(channel)
+	frame[3] = byte(size >> 24)
+	frame[4] = byte(size >> 16)
+	frame[5] = byte(size >> 8)
+	frame[6] = byte(size)
+	copy(frame[7:], payload)
+	frame[len(frame)-1] = 0xCE // frame-end
+	_, _ = conn.Write(frame)
+}
+
+func readFrame(conn net.Conn) bool {
+	_, _, _, ok := readFrameFull(conn)
+	return ok
+}
+
+func readFrameFull(conn net.Conn) (frameType byte, channel uint16, payload []byte, ok bool) {
+	hdr := make([]byte, 7)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return 0, 0, nil, false
+	}
+	frameType = hdr[0]
+	channel = uint16(hdr[1])<<8 | uint16(hdr[2])
+	size := uint32(hdr[3])<<24 | uint32(hdr[4])<<16 | uint32(hdr[5])<<8 | uint32(hdr[6])
+	payload = make([]byte, size+1) // +1 for frame-end
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return 0, 0, nil, false
+	}
+	payload = payload[:size] // trim frame-end marker
+	return frameType, channel, payload, true
+}
+
+// --- AMQP method payload builders ---
+
+func connectionStart() []byte {
+	payload := []byte{
+		0, 10, 0, 10, // class-id=10, method-id=10
+		0,          // version-major
+		9,          // version-minor
+		0, 0, 0, 0, // server-properties: empty table (length=0)
+	}
+	mech := []byte("PLAIN")
+	payload = appendLongstr(payload, mech)
+	locale := []byte("en_US")
+	payload = appendLongstr(payload, locale)
+	return payload
+}
+
+func connectionTune() []byte {
+	return []byte{
+		0, 10, 0, 30, // class=10, method=30
+		0, 0, // channel-max = 0 (no limit)
+		0, 0, 0, 0, // frame-max = 0 (no limit)
+		0, 0, // heartbeat = 0
+	}
+}
+
+func connectionOpenOk() []byte {
+	return []byte{
+		0, 10, 0, 41, // class=10, method=41
+		0, // reserved (shortstr, length 0)
+	}
+}
+
+func connectionCloseOk() []byte {
+	return []byte{0, 10, 0, 51}
+}
+
+func channelOpenOk() []byte {
+	return []byte{
+		0, 20, 0, 11, // class=20, method=11
+		0, 0, 0, 0, // reserved (longstr, length=0)
+	}
+}
+
+func channelCloseOk() []byte {
+	return []byte{0, 20, 0, 41}
+}
+
+func exchangeDeclareOk() []byte {
+	return []byte{0, 40, 0, 11}
+}
+
+func queueDeclareOk() []byte {
+	return []byte{
+		0, 50, 0, 11, // class=50, method=11
+		0, 0, // queue name (shortstr, length=0 — server-named)
+		0, 0, 0, 0, // message-count
+		0, 0, 0, 0, // consumer-count
+	}
+}
+
+func queueBindOk() []byte {
+	return []byte{0, 50, 0, 21}
+}
+
+func basicConsumeOk() []byte {
+	tag := []byte("ctag")
+	payload := []byte{0, 60, 0, 21, byte(len(tag))}
+	payload = append(payload, tag...)
+	return payload
+}
+
+func basicCancelOk() []byte {
+	tag := []byte("ctag")
+	payload := []byte{0, 60, 0, 31, byte(len(tag))}
+	payload = append(payload, tag...)
+	return payload
+}
+
+func basicQosOk() []byte {
+	return []byte{0, 60, 0, 11}
+}
+
+func confirmSelectOk() []byte {
+	return []byte{0, 85, 0, 11}
+}
+
+func appendLongstr(buf, s []byte) []byte {
+	l := uint32(len(s))
+	buf = append(buf, byte(l>>24), byte(l>>16), byte(l>>8), byte(l))
+	buf = append(buf, s...)
+	return buf
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — constants and message types
+// ---------------------------------------------------------------------------
 
 func TestConstants(t *testing.T) {
 	expected := 0
@@ -88,6 +371,298 @@ func TestNewLaunchRequest(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Unit tests — key/queue name formatting
+// ---------------------------------------------------------------------------
+
+func TestTimeLimitRequestKey(t *testing.T) {
+	invID := "test"
+	actual := TimeLimitRequestKey(invID)
+	expected := fmt.Sprintf("%s.%s", TimeLimitRequestsKey, invID)
+	if actual != expected {
+		t.Errorf("TimeLimitRequestKey returned %s instead of %s", actual, expected)
+	}
+}
+
+func TestTimeLimitRequestQueueName(t *testing.T) {
+	invID := "test"
+	actual := TimeLimitRequestQueueName(invID)
+	expected := fmt.Sprintf("road-runner-%s-tl-request", invID)
+	if actual != expected {
+		t.Errorf("TimeLimitRequestQueueName returned %s instead of %s", actual, expected)
+	}
+}
+
+func TestTimeLimitResponsesKey(t *testing.T) {
+	invID := "test"
+	actual := TimeLimitResponsesKey(invID)
+	expected := fmt.Sprintf("%s.%s", TimeLimitResponseKey, invID)
+	if actual != expected {
+		t.Errorf("TimeLimitResponsesKey returned %s instead of %s", actual, expected)
+	}
+}
+
+func TestTimeLimitResponsesQueueName(t *testing.T) {
+	invID := "test"
+	actual := TimeLimitResponsesQueueName(invID)
+	expected := fmt.Sprintf("road-runner-%s-tl-response", invID)
+	if actual != expected {
+		t.Errorf("TimeLimitResponsesQueueName returned %s instead of %s", actual, expected)
+	}
+}
+
+func TestTimeLimitDeltaRequestKey(t *testing.T) {
+	invID := "test"
+	actual := TimeLimitDeltaRequestKey(invID)
+	expected := fmt.Sprintf("%s.%s", TimeLimitDeltaKey, invID)
+	if actual != expected {
+		t.Errorf("TimeLimitDeltaRequestKey returned %s instead of %s", actual, expected)
+	}
+}
+
+func TestStopRequestKey(t *testing.T) {
+	invID := "test"
+	actual := StopRequestKey(invID)
+	expected := fmt.Sprintf("%s.%s", StopsKey, invID)
+	if actual != expected {
+		t.Errorf("StopRequestKey returned %s instead of %s", actual, expected)
+	}
+}
+
+func TestTimeLimitDeltaQueueName(t *testing.T) {
+	invID := "test"
+	actual := TimeLimitDeltaQueueName(invID)
+	expected := fmt.Sprintf("road-runner-%s-tl-delta", invID)
+	if actual != expected {
+		t.Errorf("TimeLimitDeltaQueueName returned %s instead of %s", actual, expected)
+	}
+}
+
+func TestStopQueueName(t *testing.T) {
+	invID := "test"
+	actual := StopQueueName(invID)
+	expected := fmt.Sprintf("road-runner-%s-stops-request", invID)
+	if actual != expected {
+		t.Errorf("StopQueueName returneed %s instead of %s", actual, expected)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — reconnect logic (fake AMQP server, no broker needed)
+// ---------------------------------------------------------------------------
+
+func TestDoReconnect_UpdatesConnectionInPlace(t *testing.T) {
+	silenceLoggers(t)
+
+	uri, cleanup := startFakeAMQPServer(t)
+	defer cleanup()
+
+	client, err := NewClient(uri, true)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	originalConnection := client.connection
+
+	// Drain the errors channel in the background so that
+	// connection.Close() inside doReconnect doesn't block trying to
+	// send on the NotifyClose channel. We keep a reference to the
+	// current errors channel since doReconnect replaces it.
+	errChan := client.errors
+	go func() {
+		for range errChan {
+		}
+	}()
+
+	client.doReconnect()
+
+	if client.connection == originalConnection {
+		t.Fatal("doReconnect did not update the client's connection " +
+			"field — the caller still holds the old, closed connection")
+	}
+	if client.connection == nil {
+		t.Fatal("doReconnect set connection to nil")
+	}
+
+	// Drain the new errors channel for cleanup.
+	go func() {
+		for range client.errors {
+		}
+	}()
+	client.Close()
+}
+
+func TestDoReconnect_PreservesChannels(t *testing.T) {
+	silenceLoggers(t)
+
+	uri, cleanup := startFakeAMQPServer(t)
+	defer cleanup()
+
+	client, err := NewClient(uri, true)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	origAggChan := client.aggregationChan
+	origConsChan := client.consumersChan
+
+	errChan := client.errors
+	go func() {
+		for range errChan {
+		}
+	}()
+
+	client.doReconnect()
+
+	if client.aggregationChan != origAggChan {
+		t.Fatal("doReconnect replaced aggregationChan — " +
+			"goroutines delivering to the old channel would be orphaned")
+	}
+	if client.consumersChan != origConsChan {
+		t.Fatal("doReconnect replaced consumersChan — " +
+			"AddConsumer calls on the old channel would be lost")
+	}
+	if client.connection == nil {
+		t.Fatal("connection is nil after doReconnect")
+	}
+
+	go func() {
+		for range client.errors {
+		}
+	}()
+	client.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — error channel forwarding
+// ---------------------------------------------------------------------------
+
+func TestForwardChannelErrors_AllChannelsNotify(t *testing.T) {
+	silenceLoggers(t)
+
+	uri, cleanup := startFakeAMQPServer(t)
+	defer cleanup()
+
+	client, err := NewClient(uri, false)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	ch1, err := client.connection.Channel()
+	if err != nil {
+		t.Fatalf("Channel 1: %v", err)
+	}
+	ch2, err := client.connection.Channel()
+	if err != nil {
+		t.Fatalf("Channel 2: %v", err)
+	}
+
+	client.forwardChannelErrors(ch1)
+	client.forwardChannelErrors(ch2)
+
+	// Inject a synthetic error into client.errors to verify that the
+	// channel is still the same one set up in NewClient and has not
+	// been overwritten by forwardChannelErrors.
+	testErr := &amqp.Error{Code: 999, Reason: "synthetic"}
+	go func() {
+		client.errors <- testErr
+	}()
+
+	select {
+	case e := <-client.errors:
+		if e == nil || e.Code != 999 {
+			t.Fatalf("received unexpected error: %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("could not send/receive on client.errors — " +
+			"it may have been replaced by forwardChannelErrors")
+	}
+
+	go func() {
+		for range client.errors {
+		}
+	}()
+	client.Close()
+}
+
+func TestErrorChannelNotOverwritten(t *testing.T) {
+	silenceLoggers(t)
+
+	uri, cleanup := startFakeAMQPServer(t)
+	defer cleanup()
+
+	client, err := NewClient(uri, false)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	originalErrors := client.errors
+
+	ch1, err := client.connection.Channel()
+	if err != nil {
+		t.Fatalf("Channel: %v", err)
+	}
+
+	client.forwardChannelErrors(ch1)
+
+	if client.errors != originalErrors {
+		t.Fatal("forwardChannelErrors replaced client.errors — " +
+			"the Listen() loop would no longer receive errors from the " +
+			"connection-level NotifyClose registration")
+	}
+
+	go func() {
+		for range client.errors {
+		}
+	}()
+	client.Close()
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — Listen error handling
+// ---------------------------------------------------------------------------
+
+func TestListen_ReturnsErrorInsteadOfExit(t *testing.T) {
+	silenceLoggers(t)
+
+	uri, cleanup := startFakeAMQPServer(t)
+	defer cleanup()
+
+	client, err := NewClient(uri, false)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	// Send a synthetic error to simulate a connection drop.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		client.errors <- amqp.ErrClosed
+	}()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- client.Listen()
+	}()
+
+	select {
+	case listenErr := <-errCh:
+		if listenErr == nil {
+			t.Fatal("Listen returned nil instead of an error")
+		}
+		if !errors.Is(listenErr, amqp.ErrClosed) {
+			t.Fatalf("Listen returned unexpected error: %v", listenErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Listen did not return within 5 seconds — " +
+			"it likely called os.Exit or is blocked forever")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests (require RUN_INTEGRATION_TESTS + live RabbitMQ)
+// ---------------------------------------------------------------------------
+
 func TestNewClient(t *testing.T) {
 	if !shouldrun() {
 		return
@@ -108,7 +683,6 @@ func runPublishingTest(t *testing.T, queue, key string, publish func(*Client), c
 		return
 	}
 
-	// Set up the handler function along with a channel to avoid race conditions.
 	actual := make([]byte, 0)
 	coord := make(chan int)
 	handler := func(_ context.Context, d amqp.Delivery) {
@@ -117,11 +691,9 @@ func runPublishingTest(t *testing.T, queue, key string, publish func(*Client), c
 		coord <- 1
 	}
 
-	// Set up the AMQP client.
 	client := GetClient(t)
 	client.AddConsumer(exchange(), exchangeType(), queue, key, handler, 0)
 
-	// Publish the message and check the value that was actually published.
 	publish(client)
 	<-coord
 	check(actual)
@@ -255,7 +827,6 @@ func TestPublishJobUpdate(t *testing.T) {
 		Sender:  "Deep Thought",
 	}
 
-	// PublishJobUpdate updates the `SentOn` field as a side-effect.
 	publish := func(c *Client) {
 		_ = client.PublishJobUpdate(expected)
 	}
@@ -279,7 +850,7 @@ func TestPublishEmailRequest(t *testing.T) {
 
 	expected := &EmailRequest{
 		TemplateName:        "some_template",
-		TemplateValues:      map[string]interface{}{"foo": "bar"},
+		TemplateValues:      map[string]any{"foo": "bar"},
 		Subject:             "Something crazy this way comes!",
 		ToAddress:           "somebody@example.org",
 		CourtesyCopyAddress: "somebody.else@example.org",
@@ -315,8 +886,8 @@ func TestPublishNotificationMessage(t *testing.T) {
 			Deleted:       false,
 			Email:         true,
 			EmailTemplate: "some_template",
-			Message:       map[string]interface{}{"foo": "bar"},
-			Payload:       map[string]interface{}{"baz": "quux"},
+			Message:       map[string]any{"foo": "bar"},
+			Payload:       map[string]any{"baz": "quux"},
 			Seen:          false,
 			Subject:       "Something happened!!!",
 			Type:          "idunno",
@@ -470,77 +1041,5 @@ func TestDeleteQueue(t *testing.T) {
 
 	if err = actual.Close(); err != nil {
 		t.Error(err)
-	}
-}
-
-func TestTimeLimitRequestKey(t *testing.T) {
-	invID := "test"
-	actual := TimeLimitRequestKey(invID)
-	expected := fmt.Sprintf("%s.%s", TimeLimitRequestsKey, invID)
-	if actual != expected {
-		t.Errorf("TimeLimitRequestKey returned %s instead of %s", actual, expected)
-	}
-}
-
-func TestTimeLimitRequestQueueName(t *testing.T) {
-	invID := "test"
-	actual := TimeLimitRequestQueueName(invID)
-	expected := fmt.Sprintf("road-runner-%s-tl-request", invID)
-	if actual != expected {
-		t.Errorf("TimeLimitRequestQueueName returned %s instead of %s", actual, expected)
-	}
-}
-
-func TestTimeLimitResponsesKey(t *testing.T) {
-	invID := "test"
-	actual := TimeLimitResponsesKey(invID)
-	expected := fmt.Sprintf("%s.%s", TimeLimitResponseKey, invID)
-	if actual != expected {
-		t.Errorf("TimeLimitResponsesKey returned %s instead of %s", actual, expected)
-	}
-}
-
-func TestTimeLimitResponsesQueueName(t *testing.T) {
-	invID := "test"
-	actual := TimeLimitResponsesQueueName(invID)
-	expected := fmt.Sprintf("road-runner-%s-tl-response", invID)
-	if actual != expected {
-		t.Errorf("TimeLimitResponsesQueueName returned %s instead of %s", actual, expected)
-	}
-}
-
-func TestTimeLimitDeltaRequestKey(t *testing.T) {
-	invID := "test"
-	actual := TimeLimitDeltaRequestKey(invID)
-	expected := fmt.Sprintf("%s.%s", TimeLimitDeltaKey, invID)
-	if actual != expected {
-		t.Errorf("TimeLimitDeltaRequestKey returned %s instead of %s", actual, expected)
-	}
-}
-
-func TestStopRequestKey(t *testing.T) {
-	invID := "test"
-	actual := StopRequestKey(invID)
-	expected := fmt.Sprintf("%s.%s", StopsKey, invID)
-	if actual != expected {
-		t.Errorf("StopRequestKey returned %s instead of %s", actual, expected)
-	}
-}
-
-func TestTimeLimitDeltaQueueName(t *testing.T) {
-	invID := "test"
-	actual := TimeLimitDeltaQueueName(invID)
-	expected := fmt.Sprintf("road-runner-%s-tl-delta", invID)
-	if actual != expected {
-		t.Errorf("TimeLimitDeltaQueueName returned %s instead of %s", actual, expected)
-	}
-}
-
-func TestStopQueueName(t *testing.T) {
-	invID := "test"
-	actual := StopQueueName(invID)
-	expected := fmt.Sprintf("road-runner-%s-stops-request", invID)
-	if actual != expected {
-		t.Errorf("StopQueueName returneed %s instead of %s", actual, expected)
 	}
 }

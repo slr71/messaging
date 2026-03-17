@@ -6,11 +6,10 @@ package messaging
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"math/rand"
-	"os"
+	"math/rand/v2"
 	"strconv"
-	"strings"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -102,6 +101,10 @@ type publisher struct {
 	channel  *amqp.Channel
 }
 
+// DialFunc is the signature for a function that opens an AMQP connection.
+// It exists so that tests can inject a fake dialer.
+type DialFunc func(url string) (*amqp.Connection, error)
+
 // Client encapsulates the information needed to interact via AMQP.
 type Client struct {
 	uri             string
@@ -112,23 +115,30 @@ type Client struct {
 	consumersChan   chan consumeradder
 	publisher       *publisher
 	Reconnect       bool
+	dialFunc        DialFunc
 }
 
 // NewClient returns a new *Client. It will block until the connection succeeds.
 func NewClient(uri string, reconnect bool) (*Client, error) {
+	return NewClientWithDialer(uri, reconnect, amqp.Dial)
+}
+
+// NewClientWithDialer is like NewClient but accepts a custom dial function.
+// This is primarily useful for testing.
+func NewClientWithDialer(uri string, reconnect bool, dial DialFunc) (*Client, error) {
 	c := &Client{}
-	randomizer := rand.New(rand.NewSource(time.Now().UnixNano()))
 	c.uri = uri
 	c.Reconnect = reconnect
+	c.dialFunc = dial
 	Info.Println("Attempting AMQP connection...")
 	var connection *amqp.Connection
 	var err error
 	if c.Reconnect {
 		for {
-			connection, err = amqp.Dial(c.uri)
+			connection, err = c.dialFunc(c.uri)
 			if err != nil {
 				Error.Print(err)
-				waitFor := randomizer.Intn(10)
+				waitFor := rand.IntN(10)
 				Info.Printf("Re-attempting connection in %d seconds", waitFor)
 				time.Sleep(time.Duration(waitFor) * time.Second)
 			} else {
@@ -137,7 +147,7 @@ func NewClient(uri string, reconnect bool) (*Client, error) {
 			}
 		}
 	} else {
-		connection, err = amqp.Dial(c.uri)
+		connection, err = c.dialFunc(c.uri)
 		if err != nil {
 			return nil, err
 		}
@@ -146,16 +156,30 @@ func NewClient(uri string, reconnect bool) (*Client, error) {
 	c.connection = connection
 	c.consumersChan = make(chan consumeradder)
 	c.aggregationChan = make(chan aggregationMessage)
-	c.errors = c.connection.NotifyClose(make(chan *amqp.Error))
+	c.errors = c.connection.NotifyClose(make(chan *amqp.Error, 16))
 	return c, nil
 }
 
 func (c *Client) doReconnect() {
 	closeErr := c.connection.Close()
-	if closeErr != nil && closeErr != amqp.ErrClosed {
+	if closeErr != nil && !errors.Is(closeErr, amqp.ErrClosed) {
 		Error.Printf("An error closing the old connection occurred:\n%s", closeErr)
 	}
-	c, _ = NewClient(c.uri, c.Reconnect)
+
+	// Create a new client via the same dial function, then copy the
+	// connection-related fields into the existing receiver so that
+	// every goroutine and caller sharing *c sees the new connection.
+	fresh, err := NewClientWithDialer(c.uri, c.Reconnect, c.dialFunc)
+	if err != nil {
+		Error.Printf("Failed to reconnect to AMQP broker: %s", err)
+		return
+	}
+
+	// Transfer connection-level state; keep consumers, publisher,
+	// aggregationChan and consumersChan from the original client.
+	c.connection = fresh.connection
+	c.errors = fresh.errors
+
 	for _, cs := range c.consumers {
 		cerr := c.initconsumer(cs)
 		if cerr != nil {
@@ -170,9 +194,29 @@ func (c *Client) doReconnect() {
 	}
 }
 
+// forwardChannelErrors registers a NotifyClose on the given AMQP channel and
+// starts a goroutine that forwards any close error into the shared c.errors
+// channel. This replaces the old pattern of overwriting c.errors on each call
+// to initconsumer/SetupPublishing, which meant only the last registration was
+// live.
+func (c *Client) forwardChannelErrors(ch *amqp.Channel) {
+	chErrors := ch.NotifyClose(make(chan *amqp.Error, 1))
+	go func() {
+		defer func() {
+			// c.errors may have been closed during shutdown; ignore
+			// the resulting panic from a send on closed channel.
+			_ = recover() // intentionally discarding panic value
+		}()
+		for err := range chErrors {
+			c.errors <- err
+		}
+	}()
+}
+
 // Listen will wait for messages and pass them off to handlers, which run in
-// their own goroutine.
-func (c *Client) Listen() {
+// their own goroutine. It returns a non-nil error if the connection is lost
+// and Reconnect is false.
+func (c *Client) Listen() error {
 	for {
 		select {
 		case cs := <-c.consumersChan:
@@ -186,7 +230,7 @@ func (c *Client) Listen() {
 			if c.Reconnect {
 				c.doReconnect()
 			} else {
-				os.Exit(-1)
+				return fmt.Errorf("AMQP connection error (reconnect disabled): %w", err)
 			}
 		case msg := <-c.aggregationChan:
 			go func(deliveryMsg aggregationMessage) {
@@ -239,7 +283,7 @@ func (c *Client) AddConsumerMulti(exchange, exchangeType, queue string, keys []s
 	<-adder.latch
 }
 
-// AddConsumer adds a consumer with only one binding, which is usually what you need
+// AddConsumer adds a consumer with only one binding, which is usually what you need.
 func (c *Client) AddConsumer(exchange, exchangeType, queue, key string, handler MessageHandler, prefetchCount int) {
 	c.AddConsumerMulti(exchange, exchangeType, queue, []string{key}, handler, prefetchCount)
 }
@@ -316,7 +360,9 @@ func (c *Client) QueueExists(name string, durable, autoDelete bool) (bool, error
 		nil,   // args
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "404") {
+		// A 404 (NotFound) from the broker means the queue does not exist.
+		var amqpErr *amqp.Error
+		if errors.As(err, &amqpErr) && amqpErr.Code == amqp.NotFound {
 			return false, nil
 		}
 		return false, err
@@ -351,8 +397,11 @@ func (c *Client) initconsumer(cs *consumer) error {
 	if err != nil {
 		return err
 	}
-	// for consumers, if the channel closes, refresh everything
-	c.errors = channel.NotifyClose(c.errors)
+	// Forward channel-level close notifications into the shared c.errors
+	// channel so that any channel failure triggers a reconnect. Previous
+	// code overwrote c.errors here, meaning only the last registration
+	// was live.
+	c.forwardChannelErrors(channel)
 
 	if cs.prefetchCount > 0 {
 		err = channel.Qos(
@@ -396,9 +445,9 @@ func (c *Client) initconsumer(cs *consumer) error {
 			false, //no-wait
 			nil,   //args
 		)
-	}
-	if err != nil {
-		Error.Printf("QueueBind Error: %v", err)
+		if err != nil {
+			Error.Printf("QueueBind Error: %v", err)
+		}
 	}
 
 	d, err := channel.Consume(
@@ -422,7 +471,7 @@ func (c *Client) initconsumer(cs *consumer) error {
 			}
 		}
 	}()
-	return err
+	return nil
 }
 
 // SetupPublishing initializes the publishing functionality of the client.
@@ -432,8 +481,9 @@ func (c *Client) SetupPublishing(exchange string) error {
 	if err != nil {
 		return err
 	}
-	// If the publishing channel closes, re-establish everything.
-	c.errors = channel.NotifyClose(c.errors)
+	// Forward channel-level close notifications into the shared c.errors
+	// channel so that a publisher channel failure triggers a reconnect.
+	c.forwardChannelErrors(channel)
 	err = channel.ExchangeDeclare(
 		exchange, //name
 		"topic",  //kind
@@ -451,7 +501,7 @@ func (c *Client) SetupPublishing(exchange string) error {
 		channel:  channel,
 	}
 	c.publisher = p
-	return err
+	return nil
 }
 
 // PublishingOpts contains a set of options for publishing AMQP messages.
@@ -477,8 +527,8 @@ func newTracer(tp trace.TracerProvider) trace.Tracer {
 	return tp.Tracer("github.com/cyverse-de/messaging")
 }
 
-// PublishCtxOpts sends a message to the configured exchange, using context and
-// the options specified
+// PublishContextOpts sends a message to the configured exchange, using context and
+// the options specified.
 func (c *Client) PublishContextOpts(ctx context.Context, key string, body []byte, opts *PublishingOpts) error {
 	var tracer trace.Tracer
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
@@ -498,7 +548,7 @@ func (c *Client) PublishContextOpts(ctx context.Context, key string, body []byte
 		semconv.MessagingDestinationKey.String(c.publisher.exchange),
 	)
 
-	var headers = make(amqp.Table)
+	headers := make(amqp.Table)
 
 	otel.GetTextMapPropagator().Inject(ctx, AMQPHeaderCarrier(headers))
 
@@ -520,14 +570,14 @@ func (c *Client) PublishContextOpts(ctx context.Context, key string, body []byte
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "Failed publishing message")
 	}
-	if err == amqp.ErrClosed && c.Reconnect {
+	if errors.Is(err, amqp.ErrClosed) && c.Reconnect {
 		c.doReconnect()
 	}
 	return err
 }
 
-// PublishCtxOpts sends a message to the configured exchange, using context and
-// default options
+// PublishContext sends a message to the configured exchange, using context and
+// default options.
 func (c *Client) PublishContext(ctx context.Context, key string, body []byte) error {
 	return c.PublishContextOpts(ctx, key, body, DefaultPublishingOpts)
 }
@@ -544,8 +594,8 @@ func (c *Client) Publish(key string, body []byte) error {
 }
 
 // PublishJobUpdateContext sends a message to the configured exchange with a routing key of
-// "jobs.updates"
-func (c *Client) PublishJobUpdateContext(context context.Context, u *UpdateMessage) error {
+// "jobs.updates".
+func (c *Client) PublishJobUpdateContext(ctx context.Context, u *UpdateMessage) error {
 	if u.SentOn == "" {
 		u.SentOn = strconv.FormatInt(time.Now().UnixNano()/int64(time.Millisecond), 10)
 	}
@@ -553,23 +603,25 @@ func (c *Client) PublishJobUpdateContext(context context.Context, u *UpdateMessa
 	if err != nil {
 		return err
 	}
-	return c.PublishContext(context, UpdatesKey, msgJSON)
+	return c.PublishContext(ctx, UpdatesKey, msgJSON)
 }
 
+// PublishJobUpdate sends a job update message using a background context.
 func (c *Client) PublishJobUpdate(u *UpdateMessage) error {
 	return c.PublishJobUpdateContext(context.Background(), u)
 }
 
 // PublishEmailRequestContext sends a message to the configured exchange with a
-// key of "email.requests"
-func (c *Client) PublishEmailRequestContext(context context.Context, e *EmailRequest) error {
+// key of "email.requests".
+func (c *Client) PublishEmailRequestContext(ctx context.Context, e *EmailRequest) error {
 	msgJSON, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	return c.PublishContext(context, EmailRequestPublishingKey, msgJSON)
+	return c.PublishContext(ctx, EmailRequestPublishingKey, msgJSON)
 }
 
+// PublishEmailRequest sends an email request message using a background context.
 func (c *Client) PublishEmailRequest(e *EmailRequest) error {
 	return c.PublishEmailRequestContext(context.Background(), e)
 }
@@ -577,15 +629,16 @@ func (c *Client) PublishEmailRequest(e *EmailRequest) error {
 // PublishNotificationMessageContext sends a message to the configured exchange with a
 // key of "notification.{user}", where "{user}" is the username of the person
 // receiving the notification.
-func (c *Client) PublishNotificationMessageContext(context context.Context, n *WrappedNotificationMessage) error {
+func (c *Client) PublishNotificationMessageContext(ctx context.Context, n *WrappedNotificationMessage) error {
 	routingKey := fmt.Sprintf("notification.%s", n.Message.User)
 	msgJSON, err := json.Marshal(n)
 	if err != nil {
 		return err
 	}
-	return c.PublishContextOpts(context, routingKey, msgJSON, JSONPublishingOpts)
+	return c.PublishContextOpts(ctx, routingKey, msgJSON, JSONPublishingOpts)
 }
 
+// PublishNotificationMessage sends a notification message using a background context.
 func (c *Client) PublishNotificationMessage(n *WrappedNotificationMessage) error {
 	return c.PublishNotificationMessageContext(context.Background(), n)
 }
@@ -593,7 +646,7 @@ func (c *Client) PublishNotificationMessage(n *WrappedNotificationMessage) error
 // SendTimeLimitRequestContext sends out a message to the job on the
 // "jobs.timelimits.requests.<invocationID>" topic. This should trigger the job
 // to emit a TimeLimitResponse.
-func (c *Client) SendTimeLimitRequestContext(context context.Context, invID string) error {
+func (c *Client) SendTimeLimitRequestContext(ctx context.Context, invID string) error {
 	req := &TimeLimitRequest{
 		InvocationID: invID,
 	}
@@ -601,10 +654,10 @@ func (c *Client) SendTimeLimitRequestContext(context context.Context, invID stri
 	if err != nil {
 		return err
 	}
-	return c.PublishContext(context, TimeLimitRequestKey(invID), msg)
+	return c.PublishContext(ctx, TimeLimitRequestKey(invID), msg)
 }
 
-// SendTimeLimitRequest is SendTimeLimitRequestContext with a default context
+// SendTimeLimitRequest is SendTimeLimitRequestContext with a default context.
 func (c *Client) SendTimeLimitRequest(invID string) error {
 	return c.SendTimeLimitRequestContext(context.Background(), invID)
 }
@@ -612,7 +665,7 @@ func (c *Client) SendTimeLimitRequest(invID string) error {
 // SendTimeLimitResponseContext sends out a message to the
 // jobs.timelimits.responses.<invocationID> topic containing the remaining time
 // for the job.
-func (c *Client) SendTimeLimitResponseContext(context context.Context, invID string, timeRemaining int64) error {
+func (c *Client) SendTimeLimitResponseContext(ctx context.Context, invID string, timeRemaining int64) error {
 	resp := &TimeLimitResponse{
 		InvocationID:          invID,
 		MillisecondsRemaining: timeRemaining,
@@ -621,10 +674,10 @@ func (c *Client) SendTimeLimitResponseContext(context context.Context, invID str
 	if err != nil {
 		return err
 	}
-	return c.PublishContext(context, TimeLimitResponsesKey(invID), msg)
+	return c.PublishContext(ctx, TimeLimitResponsesKey(invID), msg)
 }
 
-// SendTimeLimitResponse is SendTimeLimitResponseContext with a default context
+// SendTimeLimitResponse is SendTimeLimitResponseContext with a default context.
 func (c *Client) SendTimeLimitResponse(invID string, timeRemaining int64) error {
 	return c.SendTimeLimitResponseContext(context.Background(), invID, timeRemaining)
 }
@@ -632,7 +685,7 @@ func (c *Client) SendTimeLimitResponse(invID string, timeRemaining int64) error 
 // SendTimeLimitDeltaContext sends out a message to the
 // jobs.timelimits.deltas.<invocationID> topic containing how the job should
 // adjust its timelimit.
-func (c *Client) SendTimeLimitDeltaContext(context context.Context, invID, delta string) error {
+func (c *Client) SendTimeLimitDeltaContext(ctx context.Context, invID, delta string) error {
 	d := &TimeLimitDelta{
 		InvocationID: invID,
 		Delta:        delta,
@@ -641,17 +694,17 @@ func (c *Client) SendTimeLimitDeltaContext(context context.Context, invID, delta
 	if err != nil {
 		return err
 	}
-	return c.PublishContext(context, TimeLimitDeltaRequestKey(invID), msg)
+	return c.PublishContext(ctx, TimeLimitDeltaRequestKey(invID), msg)
 }
 
-// SendTimeLimitDelta is SendTimeLimitDeltaContext with a default context
+// SendTimeLimitDelta is SendTimeLimitDeltaContext with a default context.
 func (c *Client) SendTimeLimitDelta(invID, delta string) error {
 	return c.SendTimeLimitDeltaContext(context.Background(), invID, delta)
 }
 
 // SendStopRequestContext sends out a message to the jobs.stops.<invocation_id> topic
 // telling listeners to stop their job.
-func (c *Client) SendStopRequestContext(context context.Context, invID, user, reason string) error {
+func (c *Client) SendStopRequestContext(ctx context.Context, invID, user, reason string) error {
 	s := NewStopRequest()
 	s.Username = user
 	s.Reason = reason
@@ -660,10 +713,10 @@ func (c *Client) SendStopRequestContext(context context.Context, invID, user, re
 	if err != nil {
 		return err
 	}
-	return c.PublishContext(context, StopRequestKey(invID), msg)
+	return c.PublishContext(ctx, StopRequestKey(invID), msg)
 }
 
-// SendStopRequest is SendStopRequestContext with a default context
+// SendStopRequest is SendStopRequestContext with a default context.
 func (c *Client) SendStopRequest(invID, user, reason string) error {
 	return c.SendStopRequestContext(context.Background(), invID, user, reason)
 }
