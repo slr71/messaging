@@ -30,7 +30,7 @@ func GetClient(t *testing.T) *Client {
 		t.Error(err)
 	}
 	_ = client.SetupPublishing(exchange())
-	go func() { _ = client.Listen() }()
+	go func() { client.Listen() }()
 	return client
 }
 
@@ -354,7 +354,7 @@ func TestErrorChannelNotOverwritten(t *testing.T) {
 // Unit tests — Listen error handling
 // ---------------------------------------------------------------------------
 
-func TestListen_ReturnsErrorInsteadOfExit(t *testing.T) {
+func TestListenWithError_ReturnsErrorInsteadOfExit(t *testing.T) {
 	silenceLoggers(t)
 
 	uri, cleanup := startFakeAMQPServer(t)
@@ -374,24 +374,24 @@ func TestListen_ReturnsErrorInsteadOfExit(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- client.Listen()
+		errCh <- client.ListenWithError()
 	}()
 
 	select {
 	case listenErr := <-errCh:
 		if listenErr == nil {
-			t.Fatal("Listen returned nil instead of an error")
+			t.Fatal("ListenWithError returned nil instead of an error")
 		}
 		if !errors.Is(listenErr, amqp.ErrClosed) {
-			t.Fatalf("Listen returned unexpected error: %v", listenErr)
+			t.Fatalf("ListenWithError returned unexpected error: %v", listenErr)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Listen did not return within 5 seconds — " +
+		t.Fatal("ListenWithError did not return within 5 seconds — " +
 			"it likely called os.Exit or is blocked forever")
 	}
 }
 
-func TestListen_ReturnsNilOnGracefulClose(t *testing.T) {
+func TestListenWithError_ReturnsNilOnGracefulClose(t *testing.T) {
 	silenceLoggers(t)
 
 	uri, cleanup := startFakeAMQPServer(t)
@@ -411,20 +411,20 @@ func TestListen_ReturnsNilOnGracefulClose(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- client.Listen()
+		errCh <- client.ListenWithError()
 	}()
 
 	select {
 	case listenErr := <-errCh:
 		if listenErr != nil {
-			t.Fatalf("Listen returned %v, expected nil on graceful close", listenErr)
+			t.Fatalf("ListenWithError returned %v, expected nil on graceful close", listenErr)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Listen did not return within 5 seconds")
+		t.Fatal("ListenWithError did not return within 5 seconds")
 	}
 }
 
-func TestListen_ReturnsNilOnNilError(t *testing.T) {
+func TestListenWithError_ReturnsNilOnNilError(t *testing.T) {
 	silenceLoggers(t)
 
 	uri, cleanup := startFakeAMQPServer(t)
@@ -445,16 +445,16 @@ func TestListen_ReturnsNilOnNilError(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- client.Listen()
+		errCh <- client.ListenWithError()
 	}()
 
 	select {
 	case listenErr := <-errCh:
 		if listenErr != nil {
-			t.Fatalf("Listen returned %v, expected nil for nil AMQP error", listenErr)
+			t.Fatalf("ListenWithError returned %v, expected nil for nil AMQP error", listenErr)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Listen did not return within 5 seconds")
+		t.Fatal("ListenWithError did not return within 5 seconds")
 	}
 }
 

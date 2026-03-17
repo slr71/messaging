@@ -126,6 +126,9 @@ func NewClient(uri string, reconnect bool) (*Client, error) {
 // NewClientWithDialer is like NewClient but accepts a custom dial function.
 // This is primarily useful for testing.
 func NewClientWithDialer(uri string, reconnect bool, dial DialFunc) (*Client, error) {
+	if dial == nil {
+		return nil, errors.New("dial function cannot be nil")
+	}
 	c := &Client{}
 	c.uri = uri
 	c.Reconnect = reconnect
@@ -204,8 +207,14 @@ func (c *Client) forwardChannelErrors(ch *amqp.Channel) {
 	go func() {
 		defer func() {
 			// c.errors may have been closed during shutdown; ignore
-			// the resulting panic from a send on closed channel.
-			_ = recover() // intentionally discarding panic value
+			// the resulting panic from a send on closed channel, but
+			// re-panic on any unexpected panic to avoid hiding bugs.
+			if r := recover(); r != nil {
+				if fmt.Sprint(r) == "send on closed channel" {
+					return
+				}
+				panic(r)
+			}
 		}()
 		for err := range chErrors {
 			c.errors <- err
@@ -213,10 +222,20 @@ func (c *Client) forwardChannelErrors(ch *amqp.Channel) {
 	}()
 }
 
-// Listen will wait for messages and pass them off to handlers, which run in
-// their own goroutine. It returns a non-nil error if the connection is lost
-// and Reconnect is false.
-func (c *Client) Listen() error {
+// Listen waits for messages and passes them off to handlers, which run in
+// their own goroutine. It blocks until the connection is lost or shut down.
+// This method preserves the original API (no return value). Use ListenWithError
+// if you need to handle errors programmatically.
+func (c *Client) Listen() {
+	if err := c.ListenWithError(); err != nil {
+		Error.Printf("Listen exiting with error: %s", err)
+	}
+}
+
+// ListenWithError waits for messages and passes them off to handlers, which
+// run in their own goroutine. It returns a non-nil error if the connection is
+// lost and Reconnect is false, or nil on a clean shutdown.
+func (c *Client) ListenWithError() error {
 	for {
 		select {
 		case cs := <-c.consumersChan:
