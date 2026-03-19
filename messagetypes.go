@@ -58,27 +58,27 @@ type TimeLimitRequest struct {
 
 // EmailRequest defines the structure of a request to be sent to iplant-email.
 type EmailRequest struct {
-	TemplateName        string                 `json:"template"`
-	TemplateValues      map[string]interface{} `json:"values"`
-	Subject             string                 `json:"subject"`
-	ToAddress           string                 `json:"to"`
-	CourtesyCopyAddress string                 `json:"cc,omitempty"`
-	FromAddress         string                 `json:"from-addr,omitempty"`
-	FromName            string                 `json:"from-name,omitempty"`
+	TemplateName        string         `json:"template"`
+	TemplateValues      map[string]any `json:"values"`
+	Subject             string         `json:"subject"`
+	ToAddress           string         `json:"to"`
+	CourtesyCopyAddress string         `json:"cc,omitempty"`
+	FromAddress         string         `json:"from-addr,omitempty"`
+	FromName            string         `json:"from-name,omitempty"`
 }
 
 // NotificationMessage defines the structure of a notification message sent to
 // the Discovery Environment UI.
 type NotificationMessage struct {
-	Deleted       bool                   `json:"deleted"`
-	Email         bool                   `json:"email"`
-	EmailTemplate string                 `json:"email_template"`
-	Message       map[string]interface{} `json:"message"`
-	Payload       interface{}            `json:"payload"`
-	Seen          bool                   `json:"seen"`
-	Subject       string                 `json:"subject"`
-	Type          string                 `json:"type"`
-	User          string                 `json:"user"`
+	Deleted       bool           `json:"deleted"`
+	Email         bool           `json:"email"`
+	EmailTemplate string         `json:"email_template"`
+	Message       map[string]any `json:"message"`
+	Payload       any            `json:"payload"`
+	Seen          bool           `json:"seen"`
+	Subject       string         `json:"subject"`
+	Type          string         `json:"type"`
+	User          string         `json:"user"`
 }
 
 // WrappedNotificationMessage defines a wrapper around a notification message

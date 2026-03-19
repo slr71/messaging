@@ -3,7 +3,7 @@
 // by RabbitMQ).
 package messaging
 
-//Command is tells the receiver of a JobRequest which action to perform
+// Command tells the receiver of a JobRequest which action to perform
 type Command int
 
 // JobState defines a valid state for a job.
